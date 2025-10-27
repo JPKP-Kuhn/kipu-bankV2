@@ -22,6 +22,17 @@ interface IChainLink {
     returns (
       uint8
     );
+    
+    function latestRoundData()
+    external
+    view
+    returns (
+      uint80 roundId,
+      int256 answer,
+      uint256 startedAt,
+      uint256 updatedAt,
+      uint80 answeredInRound
+    );
 }
 
 /// @title InternalHelperKipuBank
@@ -78,6 +89,9 @@ abstract contract InternalHelperKipuBank {
     
     /// @dev Token already supported
     error TokenAlreadySupported();
+    
+    /// @dev Oracle data is stale or invalid
+    error StaleOracleData();
 
     // ============================================
     // Events
@@ -109,10 +123,19 @@ abstract contract InternalHelperKipuBank {
     // Oracle & Price Functions
     // ============================================
 
-    /// @notice Gets the latest ETH/USD price
+    /// @notice Gets the latest ETH/USD price with staleness checks
     function getEthUSD() public view returns (uint256) {
-        int256 price = oracle.latestAnswer();
-        if (price < 0) revert InvalidOraclePrice();
+        (uint80 roundId, int256 price, , uint256 updatedAt, uint80 answeredInRound) = oracle.latestRoundData();
+        
+        // Validate price
+        if (price <= 0) revert InvalidOraclePrice();
+        
+        // Check staleness: answeredInRound should be >= roundId
+        if (answeredInRound < roundId) revert StaleOracleData();
+        
+        // Check staleness: updatedAt should be within 1 hour
+        if (block.timestamp - updatedAt > 1 hours) revert StaleOracleData();
+        
         return uint256(price);
     }
 
@@ -121,13 +144,22 @@ abstract contract InternalHelperKipuBank {
         return oracle.decimals();
     }
 
-    /// @notice Get price for a specific token in USD
+    /// @notice Get price for a specific token in USD with staleness checks
     /// @param token Token address
     function getTokenPriceUSD(address token) 
     public view checkSupportedToken(token) returns (uint256) {
         IChainLink tokenOracle = tokenOracles[token];
-        int256 price = tokenOracle.latestAnswer();
-        if (price < 0) revert InvalidOraclePrice();
+        (uint80 roundId, int256 price, , uint256 updatedAt, uint80 answeredInRound) = tokenOracle.latestRoundData();
+        
+        // Validate price
+        if (price <= 0) revert InvalidOraclePrice();
+        
+        // Check staleness: answeredInRound should be >= roundId
+        if (answeredInRound < roundId) revert StaleOracleData();
+        
+        // Check staleness: updatedAt should be within 1 hour
+        if (block.timestamp - updatedAt > 1 hours) revert StaleOracleData();
+        
         return uint256(price);
     }
 

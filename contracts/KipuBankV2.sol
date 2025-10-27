@@ -3,12 +3,14 @@ pragma solidity ^0.8.30;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./InternalHelperKipuBank.sol";
 
 /// @title KipuBankV2
 /// @notice Multi-token bank with ETH and ERC-20 support, USD-based limits, and admin recovery
 /// @author JPKP-Kuhn
 contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
+    using SafeERC20 for IERC20;
     
     // ============================================
     // Roles
@@ -34,6 +36,9 @@ contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
 
     /// @notice Global limit for deposits
     uint256 public immutable bankCap;
+
+    /// @notice Per-transaction native (wei) cap for ETH withdrawals
+    uint256 public nativePerTxCapWei;
 
     /// @notice Total balance in ETH equivalent
     uint256 public totalBalance;
@@ -66,11 +71,12 @@ contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
     // Events
     // ============================================
 
-    event DepositOk(address indexed user, uint256 value, bytes feedback);
-    event WithdrawOk(address indexed user, uint256 value, bytes feedback);
-    event DepositTokenOk(address indexed user, address indexed token, uint256 value, bytes feedback);
-    event WithdrawTokenOk(address indexed user, address indexed token, uint256 value, bytes feedback);
+    event DepositOk(address indexed user, uint256 value, uint256 newBalance, bytes feedback);
+    event WithdrawOk(address indexed user, uint256 value, uint256 newBalance, bytes feedback);
+    event DepositTokenOk(address indexed user, address indexed token, uint256 value, uint256 newBalance, bytes feedback);
+    event WithdrawTokenOk(address indexed user, address indexed token, uint256 value, uint256 newBalance, bytes feedback);
     event adminRecovery(address indexed user, uint256 oldBalance, uint256 newBalance, bytes feedback);
+    event NativePerTxCapUpdated(uint256 oldCap, uint256 newCap);
 
     // ============================================
     // Constructor
@@ -184,7 +190,7 @@ contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
         totalBalance += msg.value;
         _incrementDeposit();
 
-        emit DepositOk(msg.sender, msg.value, "Deposit Success!");
+        emit DepositOk(msg.sender, msg.value, accountsBalance[msg.sender][ETH_ADDRESS], "Deposit Success!");
     }
 
     /// @notice Withdraw ETH
@@ -194,6 +200,9 @@ contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
 
         uint256 withdrawLimit = getWithdrawLimitInWei();
         if (_value > withdrawLimit) revert ExceedsWithdrawLimit();
+
+        // Check native per-transaction cap
+        if (nativePerTxCapWei != 0 && _value > nativePerTxCapWei) revert ExceedsWithdrawLimit();
 
         if (_value > accountsBalance[msg.sender][ETH_ADDRESS]) revert InsufficientBalance();
 
@@ -207,7 +216,7 @@ contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
         if (!success) revert TransferFailed();
 
         // Emit event
-        emit WithdrawOk(msg.sender, _value, "Withdraw Success!");
+        emit WithdrawOk(msg.sender, _value, accountsBalance[msg.sender][ETH_ADDRESS], "Withdraw Success!");
     }
 
     // ============================================
@@ -228,16 +237,17 @@ contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
         uint256 ethEquivalent = _convertTokenToEth(amount, token);
         if (totalBalance + ethEquivalent > bankCap) revert ExceedsBankCap();
         
-        // Effects
-        accountsBalance[msg.sender][token] += amount;
-        totalBalance += ethEquivalent;
+        // Interactions - transfer tokens from user to contract using SafeERC20
+        uint256 before = IERC20(token).balanceOf(address(this));
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = IERC20(token).balanceOf(address(this)) - before;
+        
+        // Effects - update balances after successful transfer
+        accountsBalance[msg.sender][token] += received;
+        totalBalance += _convertTokenToEth(received, token);
         _incrementDeposit();
         
-        // Interaction - transfer tokens from user to contract
-        bool success = IERC20(token).transferFrom(msg.sender, address(this), amount);
-        if (!success) revert TransferFailed();
-        
-        emit DepositTokenOk(msg.sender, token, amount, "Token Deposit Success!");
+        emit DepositTokenOk(msg.sender, token, received, accountsBalance[msg.sender][token], "Token Deposit Success!");
     }
     
     /// @notice Withdraw ERC-20 tokens
@@ -251,17 +261,16 @@ contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
         
         if (amount > accountsBalance[msg.sender][token]) revert InsufficientBalance();
         
-        // Effects
+        // Effects - update balances before transfer
         accountsBalance[msg.sender][token] -= amount;
         uint256 ethEquivalent = _convertTokenToEth(amount, token);
         totalBalance -= ethEquivalent;
         _incrementWithdraw();
         
-        // Interaction - transfer tokens to user
-        bool success = IERC20(token).transfer(msg.sender, amount);
-        if (!success) revert TransferFailed();
+        // Interactions - transfer tokens to user using SafeERC20
+        IERC20(token).safeTransfer(msg.sender, amount);
         
-        emit WithdrawTokenOk(msg.sender, token, amount, "Token Withdraw Success!");
+        emit WithdrawTokenOk(msg.sender, token, amount, accountsBalance[msg.sender][token], "Token Withdraw Success!");
     }
 
     // ============================================
@@ -327,10 +336,17 @@ contract KipuBankV2 is AccessControl, InternalHelperKipuBank {
             (bool success, ) = recipient.call{value: amount}("");
             if (!success) revert TransferFailed();
         } else {
-            // Withdraw ERC-20
-            bool success = IERC20(token).transfer(recipient, amount);
-            if (!success) revert TransferFailed();
+            // Withdraw ERC-20 using SafeERC20
+            IERC20(token).safeTransfer(recipient, amount);
         }
+    }
+    
+    /// @notice Set native per-transaction cap for ETH withdrawals
+    /// @param cap Cap in wei (0 to disable)
+    function setNativePerTxCapWei(uint256 cap) external onlyRole(ADMIN_ROLE) {
+        uint256 oldCap = nativePerTxCapWei;
+        nativePerTxCapWei = cap;
+        emit NativePerTxCapUpdated(oldCap, cap);
     }
 
     // ============================================
